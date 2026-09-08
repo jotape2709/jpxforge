@@ -1,0 +1,20 @@
+{
+  "name": "jpxforge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fábrica autônoma de software — time de IA com dashboard em pixel art. jpxlab.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "setup": "npm run setup -w @jpxforge/orchestrator",
+    "dev": "npm run build -w @jpxforge/shared && npm run dev -w @jpxforge/orchestrator",
+    "doctor": "npm run doctor -w @jpxforge/orchestrator",
+    "build": "npm run build -w @jpxforge/shared && npm run build -w @jpxforge/orchestrator",
+    "typecheck": "npm run typecheck -w @jpxforge/shared && npm run typecheck -w @jpxforge/orchestrator"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

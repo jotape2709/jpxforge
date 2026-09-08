@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Config local com API keys — NUNCA commitar
+jpxforge.config.json
+.env
+.env.*
+
+# Banco local e workspaces de projetos gerados
+jpxforge.db
+jpxforge.db-*
+workspaces/*/
+!workspaces/.gitkeep
+
+# Logs
+*.log
