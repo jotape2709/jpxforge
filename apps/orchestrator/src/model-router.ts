@@ -27,6 +27,37 @@ export interface ChatOptions {
   projectId?: string | null;
   signal?: AbortSignal;
   timeoutMs?: number;
+  // Trusted observer: receives counters only, including unusable responses.
+  onUsage?: (usage: ModelUsage | null) => void;
+}
+
+export interface ModelUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+}
+
+export class ModelOutputError extends Error {
+  constructor(public code: "refused" | "truncated" | "filtered" | "empty", message: string) {
+    super(message);
+    this.name = "ModelOutputError";
+  }
+}
+
+/** Missing or invalid usage is unknown, never evidence of a free request. */
+export function readModelUsage(value: unknown): ModelUsage | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  if (!count(raw.prompt_tokens) || !count(raw.completion_tokens)) return null;
+  const usage: ModelUsage = { prompt_tokens: raw.prompt_tokens, completion_tokens: raw.completion_tokens };
+  if (count(raw.prompt_cache_hit_tokens) && count(raw.prompt_cache_miss_tokens) &&
+      raw.prompt_cache_hit_tokens + raw.prompt_cache_miss_tokens === raw.prompt_tokens) {
+    usage.prompt_cache_hit_tokens = raw.prompt_cache_hit_tokens;
+    usage.prompt_cache_miss_tokens = raw.prompt_cache_miss_tokens;
+  }
+  return usage;
 }
 
 export interface ChatResult {
@@ -114,6 +145,8 @@ export class ModelRouter {
         messages,
         temperature: opts.temperature ?? 0.3,
         max_tokens: opts.maxTokens ?? 4096,
+        ...(target.provider === "deepseek" && target.thinking
+          ? { thinking: { type: target.thinking } } : {}),
         ...(opts.jsonMode
           ? { response_format: { type: "json_object" as const } }
           : {}),
@@ -122,10 +155,8 @@ export class ModelRouter {
     );
 
     const content = res.choices[0]?.message?.content ?? "";
-    const usage = {
-      prompt_tokens: res.usage?.prompt_tokens ?? 0,
-      completion_tokens: res.usage?.completion_tokens ?? 0,
-    };
+    const reportedUsage = readModelUsage(res.usage);
+    const usage = reportedUsage ?? { prompt_tokens: 0, completion_tokens: 0 };
 
     recordTokens(
       opts.projectId ?? null,
@@ -135,14 +166,15 @@ export class ModelRouter {
       usage.prompt_tokens,
       usage.completion_tokens
     );
+    opts.onUsage?.(reportedUsage);
 
     // Usage remains accounted even when an incomplete/refused response is unusable.
     opts.signal?.throwIfAborted();
     const choice = res.choices[0];
-    if (choice?.message?.refusal) throw new Error(`Modelo ${target.model} recusou a resposta`);
-    if (choice?.finish_reason === "length") throw new Error(`Resposta truncada do modelo ${target.model}`);
-    if (choice?.finish_reason === "content_filter") throw new Error(`Resposta filtrada do modelo ${target.model}`);
-    if (!content.trim()) throw new Error(`Resposta vazia do modelo ${target.model}`);
+    if (choice?.message?.refusal) throw new ModelOutputError("refused", `Modelo ${target.model} recusou a resposta`);
+    if (choice?.finish_reason === "length") throw new ModelOutputError("truncated", `Resposta truncada do modelo ${target.model}`);
+    if (choice?.finish_reason === "content_filter") throw new ModelOutputError("filtered", `Resposta filtrada do modelo ${target.model}`);
+    if (!content.trim()) throw new ModelOutputError("empty", `Resposta vazia do modelo ${target.model}`);
 
     return {
       content,

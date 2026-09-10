@@ -17,7 +17,8 @@
     "test": "npm run build -w @jpxforge/shared && npm run test -w @jpxforge/orchestrator",
     "build": "npm run build -w @jpxforge/shared && npm run build -w @jpxforge/orchestrator",
     "typecheck": "npm run build -w @jpxforge/shared && npm run typecheck -w @jpxforge/orchestrator",
-    "check": "npm run build && npm test"
+    "check": "npm run build && npm test",
+    "pilot": "npm run build -w @jpxforge/shared && npm run pilot -w @jpxforge/orchestrator --"
   },
   "engines": {
     "node": ">=24 <25"

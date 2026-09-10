@@ -26,6 +26,43 @@ npm start
 
 O setup solicita a chave DeepSeek em campo oculto. Ela fica em `jpxforge.config.json`, ignorado pelo Git. O doctor consulta a disponibilidade sem gerar texto. A configuração deve permanecer em uma pasta privada do usuário; no Windows a proteção efetiva depende da ACL da pasta. Sem chave válida, use a demonstração.
 
+## Piloto reproduzível com DeepSeek
+
+Para conferir o fluxo sem consumir API:
+
+```powershell
+npm run pilot -- --offline
+```
+
+Para validar um modelo real depois de configurar a chave pelo setup:
+
+```powershell
+npm run pilot -- --live --model deepseek-v4-flash
+```
+
+**`--live` faz chamadas pagas.** Sem essa opção o piloto usa fixtures. A chave também pode vir de `DEEPSEEK_API_KEY`; não a coloque no comando nem no relatório. O piloto usa somente essa chave, o endpoint oficial DeepSeek e o modelo informado para Nina, Atlas e Juno. As rotas da operação normal permanecem como estavam. O parâmetro `thinking` fica desativado neste piloto para reservar a saída ao JSON. Confirme o modelo disponível na sua conta antes da execução; a documentação atual lista [os modelos DeepSeek](https://api-docs.deepseek.com/) e [o controle de thinking](https://api-docs.deepseek.com/guides/thinking_mode/).
+
+Cada execução usa briefing fictício do Estúdio Aurora, cria um banco e workspace novos em `.forge-pilots/` e salva `pilot-report.json` antes das chamadas e ao concluir cada etapa. Não lê a fila operacional, não conecta ao WORK, não faz push e não retoma uma tentativa anterior. A pasta é ignorada pelo Git. O resultado mostra o caminho da prévia para revisão humana.
+
+O máximo é de **três chamadas**, sem fallback nem repetição automática. `--max-calls 1` ou `2` reduz esse limite; `--timeout-ms` aceita 100 a 300000 ms por chamada, com padrão de 60000. Cada chamada pede no máximo 8000 tokens de saída. Ao falhar ou cancelar, o piloto preserva a evidência em quarentena e termina com código diferente de zero. Um relatório ainda em `running` indica execução incompleta e exige inspeção. Uma nova execução paga é sempre uma nova tentativa.
+
+O relatório contém duração, tarefas, tokens informados, uso de cache quando disponível, categorias de falha, HTTP status, QA e commit local. O aceite real exige as cinco tarefas concluídas e métricas de todas as chamadas; revisão visual/comercial permanece pendente. Resposta sem métricas ou erro de rede tem uso desconhecido. Tokens de respostas truncadas continuam registrados.
+
+Para estimar USD, informe `--pricing caminho.json` com tarifas conferidas por você. Nenhum preço é embutido. O JSON deve conter os campos abaixo:
+
+| Campo | Valor |
+| --- | --- |
+| `currency` | `"USD"` |
+| `model` | O mesmo identificador passado a `--model` |
+| `input_usd_per_million` | Número: USD por milhão de tokens de entrada sem cache |
+| `cached_input_usd_per_million` | Número opcional: USD por milhão de tokens em cache |
+| `output_usd_per_million` | Número: USD por milhão de tokens de saída |
+| `checked_on` | Data em `AAAA-MM-DD` da conferência das tarifas |
+
+Sem tarifa, `estimated_usd` é `null`. Quando faltam contadores de alguma chamada, a estimativa total também é `null`, e o subtotal conhecido fica separado. Sem detalhamento de cache, a estimativa usa a tarifa de entrada sem cache e informa esse método. Isso é estimativa das chamadas deste piloto, não fatura ou orçamento monetário global; o bloqueio de gastos da operação continua no backlog.
+
+Verificação local desta etapa: Node 24.19.0, build e **58 testes aprovados**. Os testes de API DeepSeek usam servidor HTTP local simulado; o aceite com a chave real continua pendente. Comandos finitos usam `node --import tsx` para não depender do pipe interno do CLI `tsx`; `npm run dev` mantém o watch anterior.
+
 ## Fluxo implementado
 
 Nina transforma o briefing em spec validada; Atlas propõe três tarefas ordenadas; Juno gera HTML/CSS estáticos; Vera executa build e testes de um template confiável; a entrega cria commit Git. O pipeline restringe arquivos e conteúdo, não instala dependências nem executa comandos produzidos pelo modelo.

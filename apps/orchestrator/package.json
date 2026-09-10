@@ -5,14 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
+    "start": "node --import tsx src/index.ts",
     "build": "tsc --noEmit -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "setup": "tsx src/setup.ts",
-    "doctor": "tsx src/doctor.ts",
-    "demo": "tsx src/demo.ts",
-    "studio": "tsx src/index.ts --demo",
-    "test": "tsx --test test/*.test.ts"
+    "setup": "node --import tsx src/setup.ts",
+    "doctor": "node --import tsx src/doctor.ts",
+    "demo": "node --import tsx src/demo.ts",
+    "studio": "node --import tsx src/index.ts --demo",
+    "test": "node --import tsx --test test/*.test.ts",
+    "pilot": "node --import tsx src/pilot.ts"
   },
   "dependencies": {
     "@fastify/websocket": "^11.0.2",
