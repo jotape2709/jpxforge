@@ -1,65 +1,37 @@
-import Fastify from "fastify";
-import websocket from "@fastify/websocket";
-import { loadConfig } from "./config.js";
-import { registerRoutes } from "./routes.js";
-import { ModelRouter } from "./model-router.js";
-import { startWorker } from "./queue.js";
-import { startWorkPoller } from "./work-poller.js";
-import { emit, onEvent } from "./events.js";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-/**
- * JPXFORGE Orchestrator — processo local que roda a fábrica.
- * Sobe a API local, o WebSocket do dashboard, o worker da fila
- * e o poller da integração WORK.
- */
+const demo = process.argv.includes("--demo");
+if (demo) process.env.FORGE_DATA_DIR ||= path.join(fileURLToPath(new URL("../../../", import.meta.url)), ".forge-demo");
 
 async function main() {
-  const config = loadConfig(); // falha cedo se setup não foi rodado
-  const router = new ModelRouter(config);
-
-  const app = Fastify({ logger: false });
-  await app.register(websocket);
-
-  // WebSocket: dashboard se conecta aqui e recebe tudo ao vivo
-  app.get("/events/live", { websocket: true }, (socket) => {
-    const off = onEvent((ev) => {
-      try {
-        socket.send(JSON.stringify(ev));
-      } catch {
-        off();
-      }
-    });
-    socket.on("close", off);
-  });
-
-  registerRoutes(app, config);
-  startWorker(router);
-  startWorkPoller(config);
-
-  const { port, host } = config.server;
-  await app.listen({ port, host });
-
-  emit({
-    type: "system",
-    project_id: null,
-    role: null,
-    message: `jpxforge orquestrador no ar em http://${host}:${port}`,
-  });
-
-  console.log("");
-  console.log("  ▓▓▓ JPXFORGE ▓▓▓");
-  console.log(`  API local:   http://${host}:${port}`);
-  console.log(`  WebSocket:   ws://${host}:${port}/events/live`);
-  console.log(`  Health:      http://${host}:${port}/health`);
-  console.log("");
-  console.log("  Envie um briefing:");
-  console.log(`  curl -X POST http://${host}:${port}/briefings \\`);
-  console.log(`    -H "Content-Type: application/json" \\`);
-  console.log(`    -d '{"source":"manual","raw_text":"..."}'`);
-  console.log("");
+  const [{ loadConfig }, { ForgeConfigSchema }, { ModelRouter }, { DemoRouter }, { createApp }, queue, work, events] = await Promise.all([
+    import("./config.js"), import("@jpxforge/shared"), import("./model-router.js"), import("./demo-router.js"),
+    import("./server.js"), import("./queue.js"), import("./work-poller.js"), import("./events.js"),
+  ]);
+  const config = demo ? ForgeConfigSchema.parse({ version: 1, providers: {}, roles: {} }) : loadConfig();
+  const router = demo ? new DemoRouter() : new ModelRouter(config);
+  const app = await createApp(config, { demo });
+  const off = events.onEvent(event => console.log(`[${event.ts}] [${event.type}] ${event.message}`));
+  let closing = false;
+  async function shutdown() {
+    if (closing) return;
+    closing = true;
+    await work.stopWorkPoller();
+    await queue.stopWorker();
+    await app.close();
+    off();
+    (await import("./db.js")).db.close();
+  }
+  try {
+    if (config.work.auto_claim) throw new Error("auto_claim ainda indisponível: conclua o piloto WORK descrito em docs/BACKLOG.md.");
+    await app.listen(config.server);
+    work.startWorkPoller(config);
+    queue.startWorker(router);
+    process.once("SIGINT", () => { void shutdown().catch(() => { process.exitCode = 1; }); });
+    process.once("SIGTERM", () => { void shutdown().catch(() => { process.exitCode = 1; }); });
+    console.log(`JPXFORGE em http://${config.server.host}:${config.server.port}${demo ? " | DEMONSTRAÇÃO: respostas simuladas, sem gastos de API" : ""}`);
+  } catch (error) { await shutdown(); throw error; }
 }
 
-main().catch((err) => {
-  console.error("Falha ao subir o orquestrador:", err.message ?? err);
-  process.exit(1);
-});
+main().catch(error => { console.error("Falha ao iniciar:", error instanceof Error ? error.message : String(error)); process.exitCode = 1; });

@@ -17,12 +17,12 @@ async function main() {
   const ds = config.providers.deepseek;
   if (ds?.api_key) {
     try {
-      const client = new OpenAI({ baseURL: ds.base_url, apiKey: ds.api_key, timeout: 8000 });
+      const client = new OpenAI({ baseURL: ds.base_url, apiKey: ds.api_key, timeout: 8000, maxRetries: 0 });
       const models = await client.models.list();
       console.log(`  ✓ DeepSeek conectado (${models.data.length} modelos disponíveis)`);
-    } catch (err) {
+    } catch {
       allOk = false;
-      console.log(`  ✗ DeepSeek falhou: ${err instanceof Error ? err.message : err}`);
+      console.log("  ✗ DeepSeek indisponível; confira a chave, a rede e o saldo da API.");
     }
   } else {
     allOk = false;
@@ -95,6 +95,7 @@ async function main() {
   }
   console.log("");
   console.log(allOk ? "  Tudo certo. npm run dev pra ligar a fábrica." : "  Resolva os ✗ acima antes de ligar.");
+  if (!allOk) process.exitCode = 1;
   console.log("");
 }
 

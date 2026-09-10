@@ -15,3 +15,9 @@ workspaces/*/
 
 # Logs
 *.log
+
+# Demonstrations, temporary validation, local process locks
+.forge-demo/
+tmp/
+*.lock
+output/pdf/*.png

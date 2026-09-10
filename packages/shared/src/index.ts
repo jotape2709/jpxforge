@@ -25,7 +25,7 @@ export type Role = (typeof ROLES)[number];
 
 export const BriefingInputSchema = z.object({
   source: z.enum(["whatsapp", "form", "manual", "api"]).default("api"),
-  raw_text: z.string().min(10, "briefing muito curto"),
+  raw_text: z.string().trim().min(10, "briefing muito curto").max(30000),
   lead: z
     .object({
       name: z.string().optional(),
@@ -88,6 +88,16 @@ export interface Task {
   updated_at: string;
 }
 
+export const TaskSchema = z.object({
+  id: z.string().min(1), project_id: z.string().min(1), title: z.string().min(1),
+  role: z.enum(ROLES), depends_on: z.array(z.string().min(1)),
+  payload: z.record(z.unknown()),
+  status: z.enum(["queued", "running", "done", "failed", "blocked"]),
+  attempts: z.number().int().nonnegative(), max_attempts: z.number().int().positive(),
+  result: z.unknown().optional(), error: z.string().optional(),
+  created_at: z.string().datetime(), updated_at: z.string().datetime(),
+});
+
 // ── Projeto ─────────────────────────────────────────────────────
 
 export type ProjectStatus =
@@ -130,6 +140,12 @@ export interface ForgeEvent {
   ts: string;
 }
 
+export const ForgeEventSchema = z.object({
+  id: z.string().min(1), project_id: z.string().nullable(), role: z.enum(ROLES).nullable(),
+  type: z.enum(["project.created", "project.status", "task.queued", "task.started", "task.done", "task.failed", "agent.say", "tokens.used", "system"]),
+  message: z.string(), data: z.record(z.unknown()).optional(), ts: z.string().datetime(),
+});
+
 // ── Configuração (jpxforge.config.json — gerado pelo setup) ─────
 
 export const ProviderSchema = z.object({
@@ -152,8 +168,8 @@ export const ForgeConfigSchema = z.object({
   version: z.literal(1),
   server: z
     .object({
-      port: z.number().int().default(4100),
-      host: z.string().default("127.0.0.1"),
+      port: z.number().int().min(1).max(65535).default(4100),
+      host: z.enum(["127.0.0.1", "::1", "localhost"]).default("127.0.0.1"),
     })
     .default({ port: 4100, host: "127.0.0.1" }),
   providers: z.object({
@@ -166,15 +182,15 @@ export const ForgeConfigSchema = z.object({
     .object({
       token: z.string().optional(),
       owner: z.string().optional(),
-      auto_create_repo: z.boolean().default(true),
+      auto_create_repo: z.boolean().default(false),
     })
-    .default({ auto_create_repo: true }),
+    .default({ auto_create_repo: false }),
   work: z
     .object({
       base_url: z.string().default("http://127.0.0.1:4310"),
       token: z.string().optional(), // WORK_DEV_TEAM_TOKEN — nunca logar
       worker_id: z.string().default("jpxforge-slot-1"),
-      poll_interval_ms: z.number().int().default(15000),
+      poll_interval_ms: z.number().int().min(1000).max(300000).default(15000),
       auto_claim: z.boolean().default(false), // Fase 1+ liga a retirada automática
     })
     .default({
@@ -207,7 +223,11 @@ export const HandoffSchema = z.object({
   attempt: z.number().int(),
   lastSequence: z.number().int().default(0),
   claimToken: z.string().min(1),
-  leaseExpiresAt: z.string(),
+  leaseExpiresAt: z.string().datetime({ offset: true }),
+  clientApproval: z.object({
+    state: z.string(), briefDigest: z.string().optional(),
+    approvedAt: z.string().nullable().optional(), method: z.string().nullable().optional(),
+  }).passthrough().nullable().optional(),
   brief: HandoffBriefSchema,
   review: z
     .object({
@@ -215,6 +235,7 @@ export const HandoffSchema = z.object({
       notes: z.string().optional(),
     })
     .passthrough()
+    .nullable()
     .optional(),
 });
 export type Handoff = z.infer<typeof HandoffSchema>;
