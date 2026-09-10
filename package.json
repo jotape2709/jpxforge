@@ -8,13 +8,18 @@
     "apps/*"
   ],
   "scripts": {
-    "setup": "npm run setup -w @jpxforge/orchestrator",
+    "setup": "npm run build -w @jpxforge/shared && npm run setup -w @jpxforge/orchestrator",
     "dev": "npm run build -w @jpxforge/shared && npm run dev -w @jpxforge/orchestrator",
-    "doctor": "npm run doctor -w @jpxforge/orchestrator",
+    "start": "npm run build -w @jpxforge/shared && npm run start -w @jpxforge/orchestrator",
+    "doctor": "npm run build -w @jpxforge/shared && npm run doctor -w @jpxforge/orchestrator",
+    "demo": "npm run build -w @jpxforge/shared && npm run demo -w @jpxforge/orchestrator",
+    "studio": "npm run build -w @jpxforge/shared && npm run studio -w @jpxforge/orchestrator",
+    "test": "npm run build -w @jpxforge/shared && npm run test -w @jpxforge/orchestrator",
     "build": "npm run build -w @jpxforge/shared && npm run build -w @jpxforge/orchestrator",
-    "typecheck": "npm run typecheck -w @jpxforge/shared && npm run typecheck -w @jpxforge/orchestrator"
+    "typecheck": "npm run build -w @jpxforge/shared && npm run typecheck -w @jpxforge/orchestrator",
+    "check": "npm run build && npm test"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24 <25"
   }
 }

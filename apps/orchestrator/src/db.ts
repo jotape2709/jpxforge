@@ -1,10 +1,8 @@
 import Database from "better-sqlite3";
-import path from "node:path";
 import crypto from "node:crypto";
-import { chmodSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import {
   ForgeEvent,
-  Handoff,
   Project,
   ProjectStatus,
   Role,
@@ -13,22 +11,25 @@ import {
   BriefingInput,
   Spec,
 } from "@jpxforge/shared";
+import { DATA_DIR, dataPath } from "./paths.js";
 
 /**
  * Persistência 100% SQLite local: projetos, fila de tasks, eventos (replay)
  * e uso de tokens (precificação jpxlab). Zero serviços externos.
  */
 
-const DB_PATH = path.resolve(process.cwd(), "../../jpxforge.db");
+export const DB_PATH = dataPath("jpxforge.db");
 
+mkdirSync(DATA_DIR, { recursive: true });
 export const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
+db.pragma("busy_timeout = 5000");
 
 // O banco guarda claimTokens (concessões do WORK) — acesso restrito.
 try {
   chmodSync(DB_PATH, 0o600);
 } catch {
-  // Windows ignora chmod POSIX; o arquivo já nasce restrito ao usuário
+  // No Windows as permissões dependem da ACL do diretório de dados.
 }
 
 db.exec(`
@@ -158,7 +159,7 @@ export function listProjects(): Project[] {
 export function updateProject(
   id: string,
   patch: { status?: ProjectStatus; spec?: Spec; repo_url?: string }
-): void {
+): boolean {
   const sets: string[] = ["updated_at = ?"];
   const vals: unknown[] = [now()];
   if (patch.status) {
@@ -174,9 +175,10 @@ export function updateProject(
     vals.push(patch.repo_url);
   }
   vals.push(id);
-  db.prepare(`UPDATE projects SET ${sets.join(", ")} WHERE id = ?`).run(
+  return db.prepare(`UPDATE projects SET ${sets.join(", ")} WHERE id = ?
+    AND status NOT IN ('aborted', 'quarantine', 'shipped')`).run(
     ...vals
-  );
+  ).changes === 1;
 }
 
 // ── Tasks (a fila) ──────────────────────────────────────────────
@@ -185,6 +187,13 @@ export function enqueueTask(
   t: Pick<Task, "project_id" | "title" | "role"> &
     Partial<Pick<Task, "depends_on" | "payload" | "max_attempts">>
 ): Task {
+  const project = getProject(t.project_id);
+  if (!project || ["aborted", "quarantine", "shipped"].includes(project.status)) {
+    throw new Error(`Projeto indisponível para novas tarefas: ${t.project_id}`);
+  }
+  if (t.max_attempts !== undefined && (!Number.isInteger(t.max_attempts) || t.max_attempts < 1)) {
+    throw new Error("max_attempts deve ser um inteiro positivo");
+  }
   const task: Task = {
     id: newId("task"),
     project_id: t.project_id,
@@ -223,6 +232,7 @@ function rowToTask(row: Record<string, unknown>): Task {
     depends_on: JSON.parse(row.depends_on as string),
     payload: JSON.parse(row.payload as string),
     result: row.result ? JSON.parse(row.result as string) : undefined,
+    error: typeof row.error === "string" ? row.error : undefined,
   } as Task;
 }
 
@@ -232,47 +242,76 @@ function rowToTask(row: Record<string, unknown>): Task {
  */
 export function claimNextTask(): Task | null {
   const tx = db.transaction(() => {
-    const rows = db
+    const row = db
       .prepare(
-        `SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at ASC LIMIT 20`
+        `SELECT t.* FROM tasks t
+         JOIN projects p ON p.id = t.project_id
+         WHERE t.status = 'queued' AND t.attempts < t.max_attempts
+           AND p.status NOT IN ('aborted', 'quarantine', 'shipped')
+           AND NOT EXISTS (
+             SELECT 1 FROM json_each(t.depends_on) dependency
+             LEFT JOIN tasks d ON d.id = dependency.value AND d.project_id = t.project_id
+             WHERE d.id IS NULL OR d.status != 'done'
+           )
+         ORDER BY t.created_at ASC, t.rowid ASC LIMIT 1`
       )
-      .all() as Record<string, unknown>[];
-    for (const row of rows) {
-      const task = rowToTask(row);
-      const blocked = task.depends_on.some((depId) => {
-        const dep = db
-          .prepare(`SELECT status FROM tasks WHERE id = ?`)
-          .get(depId) as { status: TaskStatus } | undefined;
-        return !dep || dep.status !== "done";
-      });
-      if (blocked) continue;
-      db.prepare(
-        `UPDATE tasks SET status = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ?`
-      ).run(now(), task.id);
-      return { ...task, status: "running" as TaskStatus };
-    }
-    return null;
+      .get() as Record<string, unknown> | undefined;
+    if (!row) return null;
+    const updatedAt = now();
+    const claimed = db.prepare(
+      `UPDATE tasks SET status = 'running', attempts = attempts + 1, error = NULL, updated_at = ?
+       WHERE id = ? AND status = 'queued'`
+    ).run(updatedAt, row.id);
+    if (claimed.changes !== 1) return null;
+    return { ...rowToTask(row), status: "running" as TaskStatus, attempts: Number(row.attempts) + 1, error: undefined, updated_at: updatedAt };
   });
-  return tx();
+  return tx.immediate();
 }
 
-export function completeTask(id: string, result?: unknown): void {
-  db.prepare(
-    `UPDATE tasks SET status = 'done', result = ?, updated_at = ? WHERE id = ?`
-  ).run(result ? JSON.stringify(result) : null, now(), id);
+export function completeTask(id: string, result?: unknown, expectedAttempt?: number): boolean {
+  return db.prepare(
+    `UPDATE tasks SET status = 'done', result = ?, error = NULL, updated_at = ?
+     WHERE id = ? AND status = 'running' AND (? IS NULL OR attempts = ?)
+       AND EXISTS (SELECT 1 FROM projects p WHERE p.id = tasks.project_id
+         AND p.status NOT IN ('aborted', 'quarantine'))`
+  ).run(result === undefined ? null : JSON.stringify(result), now(), id, expectedAttempt ?? null, expectedAttempt ?? null).changes === 1;
 }
 
-export function failTask(id: string, error: string): Task | null {
-  const row = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(id) as
-    | Record<string, unknown>
-    | undefined;
-  if (!row) return null;
-  const task = rowToTask(row);
-  const exhausted = task.attempts >= task.max_attempts;
-  db.prepare(
-    `UPDATE tasks SET status = ?, error = ?, updated_at = ? WHERE id = ?`
-  ).run(exhausted ? "failed" : "queued", error, now(), id);
-  return { ...task, status: exhausted ? "failed" : "queued" };
+export function failTask(id: string, error: string, expectedAttempt?: number): Task | null {
+  return db.transaction(() => {
+    const row = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row || row.status !== "running") return null;
+    const task = rowToTask(row);
+    const status = task.attempts >= task.max_attempts ? "failed" : "queued";
+    const updatedAt = now();
+    const changed = db.prepare(
+      `UPDATE tasks SET status = ?, error = ?, updated_at = ?
+       WHERE id = ? AND status = 'running' AND (? IS NULL OR attempts = ?)
+         AND EXISTS (SELECT 1 FROM projects p WHERE p.id = tasks.project_id
+           AND p.status NOT IN ('aborted', 'quarantine', 'shipped'))`
+    ).run(status, error, updatedAt, id, expectedAttempt ?? null, expectedAttempt ?? null);
+    return changed.changes === 1 ? { ...task, status: status as TaskStatus, error, updated_at: updatedAt } : null;
+  }).immediate();
+}
+
+/** Call once on startup, before starting the only worker for this database. */
+export function recoverInterruptedTasks(): { taskIds: string[]; projectIds: string[] } {
+  return db.transaction(() => {
+    const interrupted = db.prepare(`SELECT id, project_id FROM tasks WHERE status = 'running'`)
+      .all() as { id: string; project_id: string }[];
+    const projectIds = [...new Set(interrupted.map((task) => task.project_id))];
+    const timestamp = now();
+    // An interrupted operation may already have produced files or a remote push.
+    // Require inspection instead of blindly repeating its side effects.
+    db.prepare(`UPDATE tasks SET status = 'blocked', error = ?, updated_at = ? WHERE status = 'running'`)
+      .run("Execução interrompida; inspecione os efeitos antes de retomar manualmente.", timestamp);
+    const quarantine = db.prepare(`UPDATE projects SET status = 'quarantine', updated_at = ?
+      WHERE id = ? AND status NOT IN ('aborted', 'shipped')`);
+    for (const projectId of projectIds) quarantine.run(timestamp, projectId);
+    return { taskIds: interrupted.map((task) => task.id), projectIds };
+  }).immediate();
 }
 
 export function listTasks(projectId: string): Task[] {

@@ -9,12 +9,15 @@
     "build": "tsc --noEmit -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "setup": "tsx src/setup.ts",
-    "doctor": "tsx src/doctor.ts"
+    "doctor": "tsx src/doctor.ts",
+    "demo": "tsx src/demo.ts",
+    "studio": "tsx src/index.ts --demo",
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@fastify/websocket": "^11.0.2",
     "@jpxforge/shared": "*",
-    "better-sqlite3": "^11.10.0",
+    "better-sqlite3": "^13.0.3",
     "fastify": "^5.2.0",
     "openai": "^4.77.0",
     "prompts": "^2.4.2",

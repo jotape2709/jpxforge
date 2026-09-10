@@ -1,253 +1,150 @@
-import { ForgeConfig, Handoff, BriefingInput } from "@jpxforge/shared";
-import { WorkClient, WorkConflictError, WorkRevokedError } from "./work-client.js";
+import { ForgeConfig, WorkEventPayload } from "@jpxforge/shared";
+import { WorkClient, WorkConflictError, WorkProtocolError, WorkRevokedError } from "./work-client.js";
 import {
-  confirmWorkEvent,
-  createExecution,
-  getActiveExecution,
-  closeExecution,
-  leaseExpired,
-  pendingWorkEvents,
-  queueWorkEvent,
-  Execution,
+  confirmWorkEvent, getActiveExecution, getExecution, closeExecution, leaseExpired,
+  pendingWorkEvents, queueWorkEvent, type Execution,
 } from "./executions.js";
-import {
-  abortProjectTasks,
-  createProject,
-  enqueueTask,
-  updateProject,
-} from "./db.js";
-import { agentSay, emit } from "./events.js";
+import { abortProjectTasks, updateProject } from "./db.js";
+import { emit } from "./events.js";
+import { cancelProjectWork } from "./queue.js";
 
-/**
- * WorkPoller — integração contínua com o WORK (contrato v1).
- *
- * Ciclo:
- *  1. Drena o outbox (reenvia eventos não confirmados, mesmos eventId/sequence)
- *  2. Se há execução ativa: vigia lease e revogação
- *  3. Se não há execução e auto_claim ligado: tenta retirar trabalho
- *
- * Retirou → cria projeto interno → Nina (PO) gera a Spec →
- * pipeline interna segue pelas fases seguintes. Progresso é
- * reportado ao WORK como eventos "progress"; conclusão/falha
- * como "completed"/"failed".
- */
+let poller: WorkPoller | null = null;
 
-let client: WorkClient | null = null;
-let timer: ReturnType<typeof setInterval> | null = null;
-let revoked = false;
+export function isWorkRevoked(): boolean { return poller?.revoked ?? false; }
 
-export function isWorkRevoked(): boolean {
-  return revoked;
-}
-
-/** Converte o brief estruturado do WORK num BriefingInput interno */
-function handoffToBriefing(h: Handoff): BriefingInput {
-  const raw = [
-    `Título: ${h.brief.title}`,
-    `Objetivo: ${h.brief.objective}`,
-    h.brief.scope.length ? `Escopo:\n- ${h.brief.scope.join("\n- ")}` : "",
-    h.brief.acceptanceCriteria.length
-      ? `Critérios de aceite:\n- ${h.brief.acceptanceCriteria.join("\n- ")}`
-      : "",
-    h.brief.constraints.length
-      ? `Restrições:\n- ${h.brief.constraints.join("\n- ")}`
-      : "",
-    h.review?.notes ? `Ajustes pedidos na revisão anterior: ${h.review.notes}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-
-  return { source: "api", raw_text: raw, lead: { niche: h.brief.domain } };
-}
-
-/** Reporta progresso ao WORK (passa pelo outbox — idempotente) */
 export function reportProgress(handoffId: string, message: string): void {
-  const ex = getActiveExecution();
-  if (!ex || ex.handoff_id !== handoffId || ex.status !== "active") return;
-  const payload = {
-    claimToken: ex.claim_token,
-    type: "progress",
-    message,
-  };
-  queueWorkEvent(handoffId, payload);
+  queueWorkEvent(handoffId, { type: "progress", message });
 }
-
-export function reportCompleted(
-  handoffId: string,
-  result: {
-    summary: string;
-    artifacts?: { label: string; url: string }[];
-    checks?: { name: string; status: "passed" | "failed" | "not_run"; details?: string }[];
-    risks?: string[];
-  }
-): void {
-  const ex = getActiveExecution();
-  if (!ex || ex.handoff_id !== handoffId || ex.status !== "active") return;
-  queueWorkEvent(handoffId, {
-    claimToken: ex.claim_token,
-    type: "completed",
-    result,
-  });
+export function reportCompleted(handoffId: string, result: NonNullable<WorkEventPayload["result"]>): void {
+  queueWorkEvent(handoffId, { type: "completed", result });
 }
-
 export function reportFailed(handoffId: string, message: string): void {
-  const ex = getActiveExecution();
-  if (!ex || ex.handoff_id !== handoffId || ex.status !== "active") return;
-  queueWorkEvent(handoffId, {
-    claimToken: ex.claim_token,
-    type: "failed",
-    message,
-  });
+  queueWorkEvent(handoffId, { type: "failed", message });
 }
 
-async function drainOutbox(): Promise<void> {
-  if (!client) return;
-  for (const ev of pendingWorkEvents()) {
-    const body = JSON.parse(ev.payload) as Record<string, unknown>;
-    try {
-      await client.sendEvent(ev.handoff_id, {
-        ...body,
-        eventId: ev.event_id,
-        sequence: ev.sequence,
-      } as never);
-      confirmWorkEvent(ev.event_id);
-    } catch (err) {
-      if (err instanceof WorkConflictError) {
-        // 409 = já recebido (reenvio) ou divergência — marca confirmado e segue
-        confirmWorkEvent(ev.event_id);
-      } else if (err instanceof WorkRevokedError) {
-        throw err; // sobe pro tratamento de revogação
-      }
-      // erro de rede: fica pendente, próximo tick reenvia
-    }
-  }
-}
+/** Phase 4 drain only: no claims until the complete WORK pilot is validated. */
+export class WorkPoller {
+  revoked = false;
+  private stopped = false;
+  private started = false;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private leaseTimer: ReturnType<typeof setTimeout> | null = null;
+  private flight: Promise<void> | null = null;
+  private requestController: AbortController | null = null;
 
-async function handleActiveExecution(ex: Execution): Promise<void> {
-  if (leaseExpired(ex)) {
-    // Lease venceu: WORK marca needs_attention e revoga o token.
-    // Nunca recolocar trabalho incerto na fila — abortar local.
+  constructor(private client: WorkClient, private intervalMs: number,
+    private cancel: (projectId: string) => void = cancelProjectWork) {}
+
+  private abort(ex: Execution, message: string): void {
+    this.cancel(ex.project_id);
     abortProjectTasks(ex.project_id);
     updateProject(ex.project_id, { status: "quarantine" });
-    closeExecution(ex.handoff_id, "aborted");
-    emit({
-      type: "system",
-      project_id: ex.project_id,
-      role: null,
-      message: "Lease do WORK expirado — execução abortada localmente, projeto em quarentena",
-    });
+    closeExecution(ex.handoff_id, "aborted", ex.attempt);
+    this.requestController?.abort();
+    emit({ type: "system", project_id: ex.project_id, role: null, message });
   }
-}
 
-async function tryClaim(): Promise<void> {
-  if (!client) return;
-  const handoff = await client.claim();
-  if (!handoff) return; // fila vazia — normal
-
-  const briefing = handoffToBriefing(handoff);
-  const project = createProject(briefing);
-  createExecution(handoff, project.id, client.workerId);
-
-  emit({
-    type: "project.created",
-    project_id: project.id,
-    role: null,
-    message: `Handoff "${handoff.brief.title}" retirado do WORK (tentativa ${handoff.attempt})`,
-  });
-  agentSay(
-    "product_owner",
-    project.id,
-    `Chegou trabalho do WORK: "${handoff.brief.title}". Vou transformar em spec.`
-  );
-
-  enqueueTask({
-    project_id: project.id,
-    title: `Spec: ${handoff.brief.title}`,
-    role: "product_owner",
-    payload: { kind: "ingest_briefing", handoff_id: handoff.id },
-  });
-}
-
-async function tick(): Promise<void> {
-  if (!client || revoked) return;
-  try {
-    await drainOutbox();
-    const active = getActiveExecution();
-    if (active) {
-      await handleActiveExecution(active);
-    }
-  } catch (err) {
-    if (err instanceof WorkRevokedError) {
-      revoked = true;
-      const active = getActiveExecution();
-      if (active) {
-        abortProjectTasks(active.project_id);
-        updateProject(active.project_id, { status: "aborted" });
-        closeExecution(active.handoff_id, "aborted");
-      }
-      emit({
-        type: "system",
-        project_id: null,
-        role: null,
-        message:
-          "Token do WORK revogado/cancelado — novas ações interrompidas. Verifique o WORK e rode o setup novamente se necessário.",
-      });
+  private watchLease(): void {
+    if (this.leaseTimer) clearTimeout(this.leaseTimer);
+    this.leaseTimer = null;
+    const ex = getActiveExecution(this.client.workerId);
+    if (!ex) return;
+    if (leaseExpired(ex)) {
+      this.abort(ex, "Lease do WORK expirado — execução interrompida e projeto em quarentena");
       return;
     }
-    // conflito de claim (409) ou erro de rede: espera o próximo tick
+    this.leaseTimer = setTimeout(() => {
+      this.leaseTimer = null;
+      const current = getExecution(ex.handoff_id, ex.attempt);
+      if (current?.status === "active") {
+        if (leaseExpired(current)) this.abort(current, "Lease do WORK expirou durante a execução — projeto em quarentena");
+        else this.watchLease();
+      }
+    }, Math.min(2_147_483_647, Math.max(1, Date.parse(ex.lease_expires_at) - Date.now())));
+    this.leaseTimer.unref();
   }
 
-  const active = getActiveExecution();
-  if (!active && !revoked && client) {
-    await tryClaim().catch((err) => {
-      if (!(err instanceof WorkConflictError)) {
-        emit({
-          type: "system",
-          project_id: null,
-          role: null,
-          message: `claim ao WORK falhou (tenta de novo no próximo ciclo): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        });
+  private async drain(): Promise<void> {
+    if (this.stopped || this.revoked) return;
+    this.watchLease();
+    for (const ev of pendingWorkEvents(this.client.workerId)) {
+      if (this.stopped || this.revoked) break;
+      const ex = getExecution(ev.handoff_id, ev.attempt);
+      if (!ex || ex.status !== "active") break;
+      if (leaseExpired(ex)) { this.watchLease(); break; }
+      this.requestController = new AbortController();
+      try {
+        const ack = await this.client.sendEvent(ev.handoff_id, JSON.parse(ev.payload) as WorkEventPayload, this.requestController.signal);
+        if (this.stopped || getExecution(ev.handoff_id, ev.attempt)?.status !== "active") break;
+        confirmWorkEvent(ev.event_id, ack);
+        this.watchLease();
+      } catch (error) {
+        if (error instanceof WorkRevokedError) {
+          this.revoked = true;
+          this.abort(ex, "Token do WORK revogado — execução interrompida; confira a concessão no WORK");
+        } else if (error instanceof WorkConflictError || error instanceof WorkProtocolError) {
+          // 409 is divergence, never proof of receipt. Preserve evidence unconfirmed.
+          this.abort(ex, "Conflito de protocolo WORK — evento não confirmado; inspecione a outbox e o WORK");
+        }
+        // Network errors leave this exact body pending. Never send later sequences.
+        break;
+      } finally {
+        this.requestController = null;
       }
-    });
+    }
+  }
+
+  runOnce(): Promise<void> {
+    if (this.flight) return this.flight;
+    this.flight = this.drain().finally(() => { this.flight = null; });
+    return this.flight;
+  }
+
+  start(): void {
+    if (this.stopped || this.started) return;
+    this.started = true;
+    this.watchLease();
+    const cycle = async () => {
+      this.timer = null;
+      try { await this.runOnce(); }
+      catch { emit({ type: "system", project_id: null, role: null, message: "Falha local ao drenar WORK; confira o banco antes de retomar" }); }
+      if (!this.stopped && !this.revoked) this.timer = setTimeout(cycle, this.intervalMs);
+    };
+    this.timer = setTimeout(cycle, 0);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    if (this.leaseTimer) clearTimeout(this.leaseTimer);
+    this.timer = this.leaseTimer = null;
+    this.requestController?.abort();
+    await this.flight;
   }
 }
 
 export function startWorkPoller(config: ForgeConfig): void {
+  if (poller) return;
   const w = config.work;
-  if (!w?.token) {
-    emit({
-      type: "system",
-      project_id: null,
-      role: null,
-      message: "WORK não configurado — integração desligada (rode npm run setup pra conectar)",
-    });
+  if (w.auto_claim) {
+    throw new Error("WORK auto_claim=true bloqueado: piloto completo da Fase 4 ainda pendente. Use auto_claim=false para status e drenagem de execuções antigas.");
+  }
+  if (!w.token) {
+    emit({ type: "system", project_id: null, role: null, message: "WORK não configurado — integração desligada" });
     return;
   }
-  if (!w.auto_claim) {
-    emit({
-      type: "system",
-      project_id: null,
-      role: null,
-      message:
-        "WORK configurado. auto_claim desligado (Fase 0: só status; retirada automática liga na Fase 1).",
-    });
-    return;
+  const existing = getActiveExecution();
+  if (existing && existing.worker_id !== w.worker_id) {
+    throw new Error("WORK possui concessão ativa de outro workerId; restaure o identificador estável antes de iniciar");
   }
-  client = new WorkClient(w);
-  timer = setInterval(() => {
-    tick().catch(() => {});
-  }, w.poll_interval_ms);
-  emit({
-    type: "system",
-    project_id: null,
-    role: null,
-    message: `Poller do WORK ativo (workerId=${w.worker_id}, a cada ${w.poll_interval_ms}ms)`,
-  });
+  poller = new WorkPoller(new WorkClient(w), w.poll_interval_ms);
+  poller.start();
+  emit({ type: "system", project_id: null, role: null,
+    message: "WORK configurado: novas retiradas bloqueadas até piloto da Fase 4; drenagem de concessões existentes ativa" });
 }
 
-export function stopWorkPoller(): void {
-  if (timer) clearInterval(timer);
-  timer = null;
+export async function stopWorkPoller(): Promise<void> {
+  const current = poller;
+  if (current) await current.stop();
+  poller = null;
 }

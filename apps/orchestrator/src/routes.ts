@@ -1,120 +1,76 @@
-import { FastifyInstance } from "fastify";
-import { BriefingInputSchema } from "@jpxforge/shared";
-import {
-  abortProjectTasks,
-  createProject,
-  enqueueTask,
-  getProject,
-  listProjects,
-  listTasks,
-  tokensByProject,
-  updateProject,
-} from "./db.js";
+import type { FastifyInstance } from "fastify";
+import { z } from "zod";
+import { BriefingInputSchema, type ForgeConfig } from "@jpxforge/shared";
+import { abortProjectTasks, createProject, db, enqueueTask, getProject, listProjects, listTasks, tokensByProject, updateProject } from "./db.js";
 import { emit, history } from "./events.js";
-import { ForgeConfig } from "@jpxforge/shared";
-import OpenAI from "openai";
+import { cancelProjectWork } from "./queue.js";
+import { validatePublishOptions } from "./pipeline/workspace.js";
 
-/**
- * API local do jpxforge — porta de entrada de testes/manuais
- * e fonte de dados do dashboard. (Briefings de produção chegam
- * via claim ao WORK — ver work-poller.ts.)
- */
+const PublishInputSchema = z.object({ remote: z.string(), branch: z.string().optional() }).strict();
 
-async function checkDeepSeek(config: ForgeConfig): Promise<boolean> {
-  const ds = config.providers.deepseek;
-  if (!ds?.api_key) return false;
-  try {
-    const client = new OpenAI({
-      baseURL: ds.base_url ?? "https://api.deepseek.com",
-      apiKey: ds.api_key,
-      timeout: 8000,
-    });
-    await client.models.list();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function checkOllama(config: ForgeConfig): Promise<boolean> {
-  const base = config.providers.ollama?.base_url ?? "http://localhost:11434/v1";
-  const tagsUrl = base.replace(/\/v1\/?$/, "") + "/api/tags";
-  try {
-    const res = await fetch(tagsUrl, { signal: AbortSignal.timeout(3000) });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-export function registerRoutes(app: FastifyInstance, config: ForgeConfig): void {
-  // ── Saúde do sistema ──
-  app.get("/health", async () => {
-    const [deepseek, ollama] = await Promise.all([
-      checkDeepSeek(config),
-      checkOllama(config),
-    ]);
-    return {
-      ok: deepseek,
-      providers: { deepseek, ollama },
-      ts: new Date().toISOString(),
-    };
-  });
-
-  // ── Entrada manual de briefings (testes) ──
+export function registerRoutes(app: FastifyInstance, config: ForgeConfig, options: { demo?: boolean } = {}): void {
+  app.get("/health", async () => ({
+    ok: true, service: "jpxforge", mode: options.demo ? "demo" : "live",
+    providers: Object.fromEntries(Object.entries(config.providers).map(([name, value]) => [name, { configured: !!value?.enabled && (name === "ollama" || !!value?.api_key) }])),
+    ts: new Date().toISOString(),
+  }));
   app.post("/briefings", async (req, reply) => {
     const parsed = BriefingInputSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() });
-    }
-    const project = createProject(parsed.data);
-    enqueueTask({
-      project_id: project.id,
-      title: "Transformar briefing em spec",
-      role: "product_owner",
-      payload: { kind: "ingest_briefing" },
-    });
-    emit({
-      type: "project.created",
-      project_id: project.id,
-      role: null,
-      message: `Briefing recebido (${parsed.data.source}) → projeto ${project.id}`,
-    });
-    return reply.status(201).send({ project_id: project.id });
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    const project = db.transaction(() => {
+      const project = createProject(parsed.data);
+      enqueueTask({ project_id: project.id, title: "Transformar briefing em spec", role: "product_owner", payload: { kind: "ingest_briefing" } });
+      return project;
+    })();
+    emit({ type: "project.created", project_id: project.id, role: null, message: `Briefing recebido -> projeto ${project.id}` });
+    return reply.code(201).send({ project_id: project.id });
   });
-
   app.get("/briefings/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
     const project = getProject(id);
-    if (!project) return reply.status(404).send({ error: "projeto não encontrado" });
-    return {
-      project,
-      tasks: listTasks(id),
-      tokens: tokensByProject(id),
-    };
+    if (!project) return reply.code(404).send({ error: "Projeto não encontrado" });
+    return { project, tasks: listTasks(id), tokens: tokensByProject(id) };
   });
-
-  // ── Projetos ──
   app.get("/projects", async () => ({ projects: listProjects() }));
-
+  app.post("/projects/:id/publish", async (req, reply) => {
+    if (options.demo) return reply.code(409).send({ error: "Publicação indisponível no modo demonstração" });
+    const { id } = req.params as { id: string };
+    const parsed = PublishInputSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Informe remote e, opcionalmente, branch como texto" });
+    let publish: { remote: string; branch: string };
+    try { publish = validatePublishOptions(parsed.data, id); }
+    catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : "Destino inválido" }); }
+    const result = db.transaction(() => {
+      const project = getProject(id);
+      if (!project) return { error: "Projeto não encontrado", status: 404 } as const;
+      const tasks = listTasks(id);
+      const localDelivery = tasks.some(task => task.payload.kind === "publish_landing" && task.status === "done" &&
+        typeof task.result === "object" && task.result !== null && "published" in task.result && task.result.published === false);
+      if (project.status !== "review" || !localDelivery || tasks.some(task => ["queued", "running", "failed", "blocked"].includes(task.status))) {
+        return { error: "Publicação exige entrega local revisável e nenhuma tarefa pendente ou com falha", status: 409 } as const;
+      }
+      return { task: enqueueTask({ project_id: id, title: "Publicar entrega na branch autorizada", role: "tech_lead", max_attempts: 1,
+        payload: { kind: "publish_landing", publish } }) };
+    }).immediate();
+    if (result.status !== undefined) return reply.code(result.status).send({ error: result.error });
+    emit({ type: "task.queued", project_id: id, role: "tech_lead", message: "Publicação solicitada para a branch autorizada", data: { task_id: result.task.id } });
+    return reply.code(202).send({ project_id: id, task_id: result.task.id });
+  });
   app.post("/projects/:id/abort", async (req, reply) => {
     const { id } = req.params as { id: string };
     const project = getProject(id);
-    if (!project) return reply.status(404).send({ error: "projeto não encontrado" });
-    const cancelled = abortProjectTasks(id);
+    if (!project) return reply.code(404).send({ error: "Projeto não encontrado" });
+    if (["shipped", "quarantine", "aborted"].includes(project.status)) return reply.code(409).send({ error: "Projeto já encerrado; nenhuma ação alterada" });
     updateProject(id, { status: "aborted" });
-    emit({
-      type: "project.status",
-      project_id: id,
-      role: null,
-      message: `Projeto abortado (${cancelled} tasks canceladas)`,
-    });
+    cancelProjectWork(id);
+    const cancelled = abortProjectTasks(id);
+    emit({ type: "project.status", project_id: id, role: null, message: `Projeto abortado (${cancelled} tarefas canceladas)` });
     return { ok: true, cancelled };
   });
-
-  // ── Eventos (histórico pro replay / chat) ──
-  app.get("/events", async (req) => {
+  app.get("/events", async (req, reply) => {
     const { limit } = req.query as { limit?: string };
-    return { events: history(limit ? Number(limit) : 50) };
+    const count = limit === undefined ? 100 : Number(limit);
+    if (!Number.isInteger(count) || count < 1 || count > 500) return reply.code(400).send({ error: "limit deve ser um inteiro entre 1 e 500" });
+    return { events: history(count) };
   });
 }

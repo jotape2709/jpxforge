@@ -18,6 +18,7 @@ async function validateDeepSeek(apiKey: string): Promise<boolean> {
       baseURL: "https://api.deepseek.com",
       apiKey,
       timeout: 10000,
+      maxRetries: 0,
     });
     await client.models.list();
     return true;
@@ -181,7 +182,7 @@ async function main() {
     github: {
       token: githubToken?.trim() || undefined,
       owner: "jotape2709",
-      auto_create_repo: true,
+      auto_create_repo: false,
     },
     work: {
       base_url: workUrl || "http://127.0.0.1:4310",
