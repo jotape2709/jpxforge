@@ -1,106 +1,91 @@
 # JPXFORGE
 
-Fábrica autônoma de software da **jpxlab**: um time de agentes de IA
-(cada um com seu pixel art no dashboard) que recebe briefings de clientes,
-planeja, constrói, testa e entrega — com custo mínimo por projeto.
+Equipe de IA para desenvolvimento da jpxlab. O WORK administra pedidos e aprovações; o Forge transforma briefings em software e devolve evidências para revisão.
 
-## O time
+## Começar no Windows
 
-| Agente | Papel | Modelo padrão |
-|---|---|---|
-| **Nina** | Product Owner (briefing → spec) | DeepSeek Chat |
-| **Atlas** | Tech Lead (planejamento, tasks) | DeepSeek Reasoner — *pago, prioridade* |
-| **Pixel** | Web Dev | DeepSeek Chat |
-| **Rex** | Back Dev | DeepSeek Chat |
-| **Juno** | Full-stack | DeepSeek Chat |
-| **Vera** | QA | Ollama local + ferramentas determinísticas |
-| **Sento** | Segurança | Ollama local + scanners |
+Requisito: **Node.js 24 LTS** e Git. Este checkout foi verificado com Node 24.19.0 no Windows. Na primeira utilização:
 
-## Quickstart
+```powershell
+cd C:\Users\joaop\jpxforge
+npm ci
+npm run demo
+```
 
-```bash
-# 1. Requisito: Node.js 20+
-npm install
+Ou abra `INICIAR-FORGE.cmd`. A demonstração não pede chave: usa respostas simuladas identificadas, gera arquivos reais, executa build/testes e cria um commit local. O resultado informa a pasta da página. Dados de demonstração ficam em `.forge-demo/`, separados da operação real; não são enviados ao GitHub. O modo demo valida o encadeamento, não a qualidade de um modelo real.
 
-# 2. Configuração interativa — cola sua key do DeepSeek quando pedir.
-#    Nenhum código precisa ser aberto; a key fica em jpxforge.config.json
-#    (gitignored, nunca sobe pro GitHub).
+Para acompanhar pela tela, execute **npm run studio** ou abra **ABRIR-PAINEL.cmd**, mantenha o terminal aberto e acesse **http://127.0.0.1:4100**. O painel mostra o escritório isométrico, seis integrantes, projetos, tarefas, conversa da equipe e prévia. O modo demonstração usa sempre o exemplo fixo do Estúdio Aurora, como informado na tela.
+
+Para configurar os provedores reais:
+
+```powershell
 npm run setup
-
-# 3. Diagnóstico
 npm run doctor
-
-# 4. Liga a fábrica
-npm run dev
+npm start
 ```
 
-## Integração WORK (contrato v1)
+O setup solicita a chave DeepSeek em campo oculto. Ela fica em `jpxforge.config.json`, ignorado pelo Git. O doctor consulta a disponibilidade sem gerar texto. A configuração deve permanecer em uma pasta privada do usuário; no Windows a proteção efetiva depende da ACL da pasta. Sem chave válida, use a demonstração.
 
-O jpxforge é **cliente** da API local do WORK (`http://127.0.0.1:4310`).
-O WORK administra (fila, aprovações de cliente, revisão do João);
-o jpxforge coordena a IA e os devs.
+## Fluxo implementado
 
-```
-WORK (fila de handoffs aprovados)
-   │  POST /integrations/dev-team/claim   (workerId estável)
-   ▼
-jpxforge: Nina gera Spec → Atlas planeja → devs constroem → Vera/Sento validam
-   │  POST /handoffs/{id}/events  (progress / completed / failed)
-   ▼
-WORK (revisão do João → aceite ou ajustes)
-```
+Nina transforma o briefing em spec validada; Atlas propõe três tarefas ordenadas; Juno gera HTML/CSS estáticos; Vera executa build e testes de um template confiável; a entrega cria commit Git. O pipeline restringe arquivos e conteúdo, não instala dependências nem executa comandos produzidos pelo modelo.
 
-Garantias implementadas (`src/work-client.ts`, `src/work-poller.ts`, `src/executions.ts`):
+Serviço inicial: **landing page estática**. Scripts, formulários ativos, imagens externas e serviços backend precisam de templates e isolamento adicionais. Conteúdo, identidade visual e critérios comerciais continuam sujeitos a revisão. Sem destino de publicação a entrega fica em `review`; `shipped` significa push confirmado, não deploy nem aceite do cliente.
 
-- **Outbox persistente**: todo evento ao WORK é gravado antes do envio com
-  `eventId`+`sequence`; perda de confirmação → reenvio idêntico (idempotente)
-- **Lease de 30 min**: vencimento aborta a execução local e manda o projeto
-  pra quarentena — trabalho incerto nunca volta pra fila sozinho
-- **Revogação/cancelamento**: token revogado (401/403) interrompe novas ações
-  e aborta a execução ativa
-- **Tokens nunca** em logs, URLs, prompts ou artefatos; banco SQLite e config
-  com permissão restrita (600)
-- Uma execução ativa por `workerId`; slots paralelos usam IDs estáveis distintos
+Publicação não ocorre por padrão. No painel real, após revisar o resultado, use **Enviar ao repositório** e informe URL HTTPS e branch de desenvolvimento de um repositório existente. O Git local precisa ter acesso. A API `POST /projects/:id/publish` cria uma nova tarefa de envio; solicitações repetidas enquanto há envio pendente são rejeitadas. A demonstração bloqueia essa operação. `github.token` e `auto_create_repo` sozinhos não publicam. A interface interna `runNextTask(router, { publish: { remote, branch } })` continua disponível para testes/integrações. Os testes usam repositório bare temporário local.
 
-> **Fase 0:** o poller nasce com `auto_claim: false` — o jpxforge testa a
-> conexão (`npm run doctor`) mas ainda **não retira trabalho**. A retirada
-> automática liga na Fase 1, quando a pipeline de build existir de verdade.
+## Comandos e API
 
-## Testando (Fase 0)
-
-Com `npm run dev` rodando:
-
-```bash
-curl -X POST http://127.0.0.1:4100/briefings \
-  -H "Content-Type: application/json" \
-  -d @examples/briefing-exemplo.json
+```powershell
+npm run build
+npm run typecheck
+npm test
+npm run check
 ```
 
-Anote o `project_id` retornado e acompanhe:
+O pacote compartilhado é compilado antes dos comandos que o importam. `npm run dev` executa em modo de desenvolvimento. `FORGE_DATA_DIR` seleciona uma pasta de dados isolada; caminhos não dependem da pasta onde o comando foi chamado.
 
-```bash
-curl http://127.0.0.1:4100/briefings/<project_id>
+Servidor padrão: `http://127.0.0.1:4100`. Enviar um briefing com o servidor real ativo:
+
+```powershell
+$briefing = @{ source = 'manual'; raw_text = 'Crie uma landing page estática para um estúdio de design, com serviços e contato.' } | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:4100/briefings -Method Post -ContentType 'application/json' -Body $briefing
 ```
 
-Você verá a Nina transformar o briefing cru em spec estruturada,
-com tokens contabilizados em `tokens`.
+| Rota | Finalidade |
+| --- | --- |
+| POST `/briefings` | Criar projeto e tarefa inicial de forma atômica |
+| GET `/briefings/:id` | Projeto, tarefas, resultados e tokens |
+| GET `/projects` | Últimos projetos |
+| POST `/projects/:id/abort` | Interromper trabalho e impedir conclusão tardia |
+| POST `/projects/:id/publish` | Solicitar envio explícito de uma entrega pronta ao repositório |
+| GET `/` | Escritório, projetos, tarefas e conversa |
+| GET `/preview/:id/index.html` | Prévia restrita após QA aprovado |
+| GET `/events?limit=100` | Histórico limitado entre 1 e 500 eventos |
+| WS `/events/live` | Eventos persistidos transmitidos ao vivo |
+| GET `/health` | Processo ativo, modo e provedores configurados; não certifica conexão externa |
 
-## API local
+Servidor somente local, com verificação de origem e hostname. Não exponha esta API na internet: autenticação remota ainda não foi implementada. Tarefas interrompidas por crash entram em quarentena para inspeção de possíveis efeitos já executados. O projeto ainda não possui uma tela para retomar quarentena.
 
-| Rota | Descrição |
-|---|---|
-| `POST /briefings` | Recebe briefing direto (testes/manual) |
-| `GET /briefings/:id` | Status do projeto + spec + tasks + tokens |
-| `GET /projects` | Histórico de projetos |
-| `POST /projects/:id/abort` | Kill switch |
-| `GET /events` | Histórico de eventos (replay) |
-| `WS /events/live` | Stream em tempo real pro dashboard |
-| `GET /health` | Saúde dos providers |
+## WORK e roadmap
 
-## Roadmap
+Contrato v1 preservado. Cliente HTTP e outbox persistente foram reforçados para sequências, ACK, conflitos, leases e novas tentativas. **Novas retiradas automáticas permanecem bloqueadas**, inclusive com `auto_claim: true`, até o piloto completo. Configurado com token e `auto_claim: false`, o poller pode drenar concessões antigas. Não teste com dados reais de clientes.
 
-- [x] **Fase 0** — Fundação: contratos, fila SQLite, ModelRouter, Nina (PO), API local, setup wizard, **adaptador WORK v1** (claim/outbox/lease/revogação)
-- [ ] **Fase 1** — Atlas planeja, Juno constrói landing page em workspace, QA roda build/testes, push pro GitHub, `auto_claim` ligado
-- [ ] **Fase 2** — Dashboard: escritório isométrico pixel art, chat da equipe, tela de Settings (trocar keys pelo navegador)
-- [ ] **Fase 3** — Vera + Sento com scanners, quarentena automática, medidor de custo em R$
-- [ ] **Fase 4** — Integração ativa com o WORK, templates por tipo de serviço
+| Fase | Estado desta passagem |
+| --- | --- |
+| 0 - Fundação | Corrigida; consulte evidências finais no HANDOFF |
+| 1 - Pipeline seca | Implementação/testes offline; DeepSeek e push GitHub de projeto real pendentes |
+| 2 - Dashboard isométrico e chat | MVP local verificado no navegador; seis sprites, briefing, prévia, stream e reconexão; configurações visuais e chat livre pendentes |
+| 3 - Segurança/quarentena/custos | Proteções básicas e tokens; sandbox, scanners, orçamento monetário e retomada pendentes |
+| 4 - WORK ativo e templates | Adaptador reforçado; piloto integrado e outros serviços pendentes |
+
+## Continuidade entre modelos
+
+Leia [AGENTS.md](AGENTS.md), [HANDOFF](docs/HANDOFF.md) e a [fila única](docs/BACKLOG.md). Antes de terminar, cada modelo deve registrar o que fez, testes e próximos passos, gerar um novo PDF e instruir o seguinte a repetir o processo. Ao atingir **90% de uso**, o PDF vira prioridade.
+
+```powershell
+python -m pip install reportlab
+python scripts/export_handoff.py
+```
+
+Documento portátil: `output/pdf/JPXFORGE-CONTINUIDADE.pdf`. É uma fotografia datada; confira sempre o checkout atual. Nenhum segredo deve aparecer no documento ou em um commit.
