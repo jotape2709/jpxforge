@@ -249,3 +249,42 @@ test("tokens from a rejected truncated response are still recorded", async () =>
     assert.equal(rows.reduce((sum, row) => sum + row.prompt_tokens + row.completion_tokens, 0), 10);
   } finally { await provider.close(); }
 });
+
+test("local usage persistence failures never dispatch the configured fallback", async () => {
+  const provider = await mockProvider((_body, response) => completion(response));
+  try {
+    await assert.rejects(new ModelRouter(routerConfig(provider.url)).chat("fullstack_dev", messages, {
+      onUsage() { throw new Error("private-storage-sentinel"); },
+    }), error => error instanceof Error && error.name === "ModelEvidenceError" && !error.message.includes("private-storage-sentinel"));
+    assert.equal(provider.calls.length, 1);
+  } finally { await provider.close(); }
+});
+
+test("SQLite usage write failure still notifies the observer and forbids paid fallback", async () => {
+  const provider = await mockProvider((_body, response) => completion(response));
+  let observed: unknown;
+  db.exec("CREATE TEMP TRIGGER reject_usage BEFORE INSERT ON token_usage BEGIN SELECT RAISE(FAIL, 'private-db-sentinel'); END");
+  try {
+    await assert.rejects(new ModelRouter(routerConfig(provider.url)).chat("fullstack_dev", messages, {
+      onUsage(usage) { observed = usage; },
+    }), error => error instanceof Error && error.name === "ModelEvidenceError" && !error.message.includes("private-db-sentinel"));
+    assert.deepEqual(observed, { prompt_tokens: 3, completion_tokens: 2 });
+    assert.equal(provider.calls.length, 1);
+  } finally { db.exec("DROP TRIGGER reject_usage"); await provider.close(); }
+});
+
+test("normal model routes expose HTTP status without provider error bodies or headers", async () => {
+  const provider = await mockProvider((_body, response) => {
+    response.writeHead(401, { "Content-Type": "application/json", "x-debug": "private-http-sentinel" });
+    response.end(JSON.stringify({ error: { message: "private-http-sentinel", type: "authentication_error" } }));
+  });
+  try {
+    await assert.rejects(new ModelRouter(routerConfig(provider.url, false)).chat("fullstack_dev", messages), error => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as Error & { status: number }).status, 401);
+      assert.ok(!JSON.stringify([error, error.message, error.cause]).includes("private-http-sentinel"));
+      return true;
+    });
+    assert.equal(provider.calls.length, 1);
+  } finally { await provider.close(); }
+});

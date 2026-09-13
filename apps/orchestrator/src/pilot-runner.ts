@@ -4,7 +4,7 @@ import { db, createProject, enqueueTask, getProject, listTasks } from "./db.js";
 import { runNextTask } from "./queue.js";
 import { dataPath } from "./paths.js";
 import { PipelineSafetyError, type PipelineRouter } from "./pipeline/contracts.js";
-import { ModelOutputError, type ModelUsage } from "./model-router.js";
+import { ModelEvidenceError, ModelOutputError, type ModelUsage } from "./model-router.js";
 import type { Role } from "@jpxforge/shared";
 import type { PilotOptions, PilotPricing } from "./pilot-options.js";
 
@@ -13,10 +13,10 @@ export const PILOT_BRIEFING = "Crie uma landing page estática de demonstração
 interface PilotCall {
   sequence: number;
   role: Role;
-  status: "running" | "success" | "failed" | "cancelled";
+  status: "running" | "success" | "failed" | "cancelled" | "not_sent";
   duration_ms: number;
   usage: ModelUsage | null;
-  failure: "refused" | "truncated" | "filtered" | "empty" | "timeout" | "cancelled" | "provider_error" | null;
+  failure: "refused" | "truncated" | "filtered" | "empty" | "invalid_response" | "timeout" | "cancelled" | "provider_error" | "usage_missing" | "checkpoint_error" | "evidence_error" | null;
   http_status: number | null;
 }
 export interface PilotReport {
@@ -41,10 +41,15 @@ export interface PilotReport {
   published: false;
   live_provider_validated: boolean;
   human_review: "pending";
-  stop_reason: "completed" | "call_limit" | "model_error" | "pipeline_error" | "usage_missing" | "cancelled" | null;
+  stop_reason: "completed" | "call_limit" | "model_error" | "pipeline_error" | "usage_missing" | "checkpoint_error" | "evidence_error" | "cancelled" | null;
+}
+
+class PilotCheckpointError extends PipelineSafetyError {
+  constructor() { super("Não foi possível salvar a evidência do piloto; inspecione o armazenamento antes de retomar."); }
 }
 
 function costs(mode: PilotOptions["mode"], calls: PilotCall[], pricing?: PilotPricing): PilotReport["cost"] {
+  calls = calls.filter(c => c.status !== "not_sent");
   if (mode === "offline") return { currency: "USD", estimated_usd: 0, recorded_usage_estimate_usd: 0, method: "offline_free", pricing: null };
   if (!pricing) return { currency: "USD", estimated_usd: null, recorded_usage_estimate_usd: null, method: "unpriced", pricing: null };
   let sum = 0, upperEstimate = false;
@@ -88,17 +93,26 @@ export async function runPilot(options: PilotOptions, router: PipelineRouter, se
     cost: costs(options.mode, [], settings.pricing), qa_passed: false, local_commit: null,
     workspace: null, published: false, live_provider_validated: false, human_review: "pending", stop_reason: null,
   };
-  const checkpoint = () => {
+  let checkpointFailed = false;
+  const checkpoint = (finalAttempt = false) => {
+    if (checkpointFailed && !finalAttempt) throw new PilotCheckpointError();
     report.duration_ms = Math.round(performance.now() - started);
     report.project_status = getProject(project.id)!.status;
     report.tasks = listTasks(project.id).map(t => ({ kind: String(t.payload.kind), status: t.status, attempts: t.attempts }));
     report.tokens = { prompt: 0, completion: 0, unreported_calls: 0 };
     for (const call of report.calls) {
       if (call.usage) { report.tokens.prompt += call.usage.prompt_tokens; report.tokens.completion += call.usage.completion_tokens; }
-      else if (options.mode === "live") report.tokens.unreported_calls++;
+      else if (options.mode === "live" && call.status !== "not_sent") report.tokens.unreported_calls++;
     }
     report.cost = costs(options.mode, report.calls, settings.pricing);
-    settings.checkpoint?.(report);
+    try { settings.checkpoint?.(report); }
+    catch {
+      checkpointFailed = true;
+      report.status = "failed";
+      report.stop_reason = "checkpoint_error";
+      report.live_provider_validated = false;
+      throw new PilotCheckpointError();
+    }
   };
   const boundedRouter: PipelineRouter = { async chat(role, messages, opts = {}) {
     opts.signal?.throwIfAborted();
@@ -109,21 +123,32 @@ export async function runPilot(options: PilotOptions, router: PipelineRouter, se
     const call: PilotCall = { sequence: report.calls.length + 1, role, status: "running", duration_ms: 0,
       usage: null, failure: null, http_status: null };
     report.calls.push(call);
-    checkpoint(); // Persist the attempt before network access; a crash remains visibly incomplete.
+    // Persist the intent before network access; a crash remains visibly incomplete.
+    try { checkpoint(); }
+    catch { call.status = "not_sent"; call.failure = "checkpoint_error"; throw new PilotCheckpointError(); }
     const callStarted = performance.now();
     try {
       const result = await router.chat(role, messages, { ...opts, maxTokens: Math.min(opts.maxTokens ?? 4096, 8000),
         timeoutMs: options.timeoutMs, onUsage: usage => { call.usage = usage; checkpoint(); } });
       if (options.mode === "offline") call.usage = result.usage;
+      opts.signal?.throwIfAborted();
+      if (options.mode === "live" && !call.usage) {
+        report.stop_reason = "usage_missing";
+        throw new PipelineSafetyError("Uso do modelo não informado; piloto interrompido antes de novas chamadas.");
+      }
       call.status = "success";
       return result;
     } catch (error) {
       call.status = opts.signal?.aborted ? "cancelled" : "failed";
-      call.failure = opts.signal?.aborted ? "cancelled" : error instanceof ModelOutputError ? error.code
+      call.failure = checkpointFailed ? "checkpoint_error" : opts.signal?.aborted ? "cancelled"
+        : report.stop_reason === "usage_missing" ? "usage_missing"
+        : error instanceof ModelEvidenceError ? "evidence_error" : error instanceof ModelOutputError ? error.code
         : error instanceof Error && error.name === "APIConnectionTimeoutError" ? "timeout" : "provider_error";
       if (error && typeof error === "object" && "status" in error && typeof error.status === "number" &&
           Number.isInteger(error.status) && error.status >= 100 && error.status <= 599) call.http_status = error.status;
-      report.stop_reason = opts.signal?.aborted ? "cancelled" : "model_error";
+      report.stop_reason = checkpointFailed ? "checkpoint_error" : opts.signal?.aborted ? "cancelled"
+        : report.stop_reason === "usage_missing" ? "usage_missing"
+        : error instanceof ModelEvidenceError ? "evidence_error" : "model_error";
       // Provider errors may echo credentials or request text; never persist their raw message.
       throw new PipelineSafetyError(opts.signal?.aborted ? "Piloto cancelado." : "Modelo indisponível ou resposta inválida. Revise chave, saldo, modelo e conexão antes de uma nova execução.");
     } finally {
@@ -131,8 +156,8 @@ export async function runPilot(options: PilotOptions, router: PipelineRouter, se
       checkpoint();
     }
   } };
-  checkpoint();
   try {
+    checkpoint();
     for (let tick = 0; tick < 6; tick++) {
       settings.signal?.throwIfAborted();
       // The production queue keeps its retry policy; this synthetic run has one attempt per task.
@@ -158,14 +183,20 @@ export async function runPilot(options: PilotOptions, router: PipelineRouter, se
     }
   } catch {
     report.status = settings.signal?.aborted ? "cancelled" : "failed";
-    report.stop_reason = settings.signal?.aborted ? "cancelled" : "pipeline_error";
+    report.stop_reason = checkpointFailed ? "checkpoint_error" : settings.signal?.aborted ? "cancelled" : report.stop_reason ?? "pipeline_error";
   } finally {
-    if (report.status !== "passed") db.transaction(() => {
+    const quarantine = () => db.transaction(() => {
       db.prepare("UPDATE projects SET status = 'quarantine', updated_at = ? WHERE id = ?").run(new Date().toISOString(), project.id);
       db.prepare("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE project_id = ? AND status IN ('queued', 'running')")
         .run(new Date().toISOString(), project.id);
     }).immediate();
-    checkpoint();
+    if (report.status !== "passed") quarantine();
+    try { checkpoint(true); }
+    catch {
+      // Even failure of the final success report invalidates acceptance.
+      quarantine();
+      throw new PilotCheckpointError();
+    }
   }
   return report;
 }

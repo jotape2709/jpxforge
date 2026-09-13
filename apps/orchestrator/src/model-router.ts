@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { ForgeConfig, ModelTarget, Role } from "@jpxforge/shared";
 import { recordTokens } from "./db.js";
+import { PipelineSafetyError } from "./pipeline/contracts.js";
 
 /**
  * ModelRouter — coração de custo/flexibilidade do jpxforge.
@@ -39,9 +40,22 @@ export interface ModelUsage {
 }
 
 export class ModelOutputError extends Error {
-  constructor(public code: "refused" | "truncated" | "filtered" | "empty", message: string) {
+  constructor(public code: "refused" | "truncated" | "filtered" | "empty" | "invalid_response", message: string) {
     super(message);
     this.name = "ModelOutputError";
+  }
+}
+
+/** Local evidence failure is terminal: another provider cannot repair storage. */
+export class ModelEvidenceError extends PipelineSafetyError {
+  override name = "ModelEvidenceError";
+  constructor() { super("Não foi possível registrar o uso do modelo; inspecione o armazenamento antes de retomar."); }
+}
+
+class ModelProviderError extends Error {
+  constructor(timeout: boolean, public status?: number) {
+    super(timeout ? "O provedor excedeu o tempo limite da chamada." : "Falha na API do modelo; confira conexão, modelo, chave e saldo.");
+    this.name = timeout ? "APIConnectionTimeoutError" : "ModelProviderError";
   }
 }
 
@@ -118,10 +132,14 @@ export class ModelRouter {
         const result = await this.callTarget(role, target, messages, opts, i > 0);
         return result;
       } catch (err) {
+        if (err instanceof ModelEvidenceError) throw err;
         // User cancellation stops the entire route, including any paid fallback.
         opts.signal?.throwIfAborted();
         if (err instanceof Error && ["AbortError", "APIUserAbortError"].includes(err.name)) throw err;
-        lastError = err;
+        // SDK messages, headers and causes can echo request data or credentials.
+        lastError = err instanceof OpenAI.APIError
+          ? new ModelProviderError(err instanceof OpenAI.APIConnectionTimeoutError, err.status)
+          : err;
         // Fallback só faz sentido se existir próximo alvo
         if (i < targets.length - 1) continue;
       }
@@ -154,26 +172,34 @@ export class ModelRouter {
       { signal: opts.signal, timeout: opts.timeoutMs ?? 60_000, maxRetries: 0 }
     );
 
-    const content = res.choices[0]?.message?.content ?? "";
-    const reportedUsage = readModelUsage(res.usage);
+    const reportedUsage = readModelUsage(res?.usage);
     const usage = reportedUsage ?? { prompt_tokens: 0, completion_tokens: 0 };
-
-    recordTokens(
+    // Observe both stores even if one fails, before inspecting untrusted content.
+    let evidenceFailed = false;
+    try { opts.onUsage?.(reportedUsage); } catch { evidenceFailed = true; }
+    try { recordTokens(
       opts.projectId ?? null,
       role,
       target.provider,
       target.model,
       usage.prompt_tokens,
       usage.completion_tokens
-    );
-    opts.onUsage?.(reportedUsage);
+    ); } catch { evidenceFailed = true; }
+    if (evidenceFailed) throw new ModelEvidenceError();
 
     // Usage remains accounted even when an incomplete/refused response is unusable.
     opts.signal?.throwIfAborted();
-    const choice = res.choices[0];
+    const choice = Array.isArray(res?.choices) ? res.choices[0] : undefined;
+    if (!choice || typeof choice.message !== "object" || !choice.message) {
+      throw new ModelOutputError("invalid_response", "Resposta do provedor fora do protocolo esperado.");
+    }
     if (choice?.message?.refusal) throw new ModelOutputError("refused", `Modelo ${target.model} recusou a resposta`);
     if (choice?.finish_reason === "length") throw new ModelOutputError("truncated", `Resposta truncada do modelo ${target.model}`);
     if (choice?.finish_reason === "content_filter") throw new ModelOutputError("filtered", `Resposta filtrada do modelo ${target.model}`);
+    const content = choice.message.content ?? "";
+    if (typeof content !== "string" || choice.finish_reason !== "stop") {
+      throw new ModelOutputError("invalid_response", "Resposta do provedor fora do protocolo esperado.");
+    }
     if (!content.trim()) throw new ModelOutputError("empty", `Resposta vazia do modelo ${target.model}`);
 
     return {

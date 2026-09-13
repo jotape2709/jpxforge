@@ -36,5 +36,13 @@ export type LandingContent = z.infer<typeof LandingContentSchema>;
 
 export function parseModelJson(content: string): unknown {
   if (Buffer.byteLength(content, "utf8") > 300_000) throw new PipelineSafetyError("Resposta do modelo excede 300 KB");
-  return JSON.parse(content);
+  try { return JSON.parse(content); }
+  catch { throw new PipelineSafetyError("Modelo retornou JSON inválido; revise a execução antes de tentar novamente."); }
+}
+
+/** Parser diagnostics can quote model data; persist only application-owned text. */
+export function parseModelOutput<S extends z.ZodTypeAny>(schema: S, content: string): z.infer<S> {
+  const result = schema.safeParse(parseModelJson(content));
+  if (!result.success) throw new PipelineSafetyError("Resposta do modelo não atende ao contrato desta etapa.");
+  return result.data;
 }

@@ -145,18 +145,105 @@ test("truncated model output retains usage and cost evidence without another pai
   } finally { await p.close(); }
 });
 
-test("missing usage fails live acceptance even if the generated page passes QA", async () => {
+test("missing usage stops the live pilot before any further paid work", async () => {
   const p = await provider((res, i) => completion(res, i, null));
   try {
     const report = await runPilot(live, p.router, { pricing });
-    assert.equal(report.qa_passed, true);
+    assert.equal(report.qa_passed, false);
     assert.equal(report.status, "failed");
     assert.equal(report.stop_reason, "usage_missing");
     assert.equal(report.live_provider_validated, false);
-    assert.equal(report.tokens.unreported_calls, 3);
+    assert.equal(report.tokens.unreported_calls, 1);
+    assert.equal(p.calls.length, 1);
     assert.equal(report.cost.estimated_usd, null);
   } finally { await p.close(); }
 });
+
+test("malformed response envelopes preserve reported usage and safe failure evidence", async () => {
+  const p = await provider(res => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ usage }));
+  });
+  try {
+    const report = await runPilot(live, p.router, { pricing });
+    assert.equal(report.status, "failed");
+    assert.equal(report.calls[0].failure, "invalid_response");
+    assert.equal(report.tokens.prompt, 100);
+    assert.equal(report.cost.estimated_usd, 0.000084);
+    assert.equal(p.calls.length, 1);
+  } finally { await p.close(); }
+});
+
+for (const stage of [0, 1, 2]) for (const format of ["json", "schema"]) {
+  const content = format === "json" ? '{"private-response-sentinel": invalid}'
+    : stage === 0 ? JSON.stringify({ ...JSON.parse(responses[0].content), service_type: "private-response-sentinel" })
+    : JSON.stringify({ ...JSON.parse(responses[stage].content), "private-response-sentinel": true });
+  test(`stage ${stage + 1} invalid ${format} never persists raw model data in diagnostic errors`, async () => {
+    const p = await provider((res, index) => {
+      if (index !== stage) { completion(res, index); return; }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content }, finish_reason: "stop" }], usage }));
+    });
+    try {
+      const report = await runPilot(live, p.router);
+      assert.equal(report.status, "failed");
+      assert.equal(p.calls.length, stage + 1);
+      const stored = JSON.stringify([report, listTasks(report.project_id), db.prepare("SELECT * FROM events").all()]);
+      assert.ok(!stored.includes("private-response-sentinel"));
+    } finally { await p.close(); }
+  });
+}
+
+test("persistent checkpoint failure at completion rejects acceptance and quarantines the finished project", async () => {
+  let projectId = "";
+  const p = await provider((res, i) => completion(res, i));
+  try {
+    await assert.rejects(runPilot(live, p.router, { checkpoint(snapshot) {
+      projectId = snapshot.project_id;
+      if (snapshot.status === "passed") throw new Error("private-final-path-sentinel");
+    } }), error => error instanceof Error && !error.message.includes("private-final-path-sentinel"));
+    assert.equal(p.calls.length, 3);
+    assert.equal((db.prepare("SELECT status FROM projects WHERE id = ?").get(projectId) as { status: string }).status, "quarantine");
+    assert.ok(listTasks(projectId).every(t => t.status === "done"));
+  } finally { await p.close(); }
+});
+
+test("a permanently unavailable checkpoint store stops before dispatch and leaves recoverable quarantine", async () => {
+  const p = await provider((res, i) => completion(res, i));
+  try {
+    await assert.rejects(runPilot(live, p.router, { checkpoint() { throw new Error("private-disk-sentinel"); } }),
+      error => error instanceof Error && !error.message.includes("private-disk-sentinel"));
+    assert.equal(p.calls.length, 0);
+    assert.equal((db.prepare("SELECT status FROM projects").get() as { status: string }).status, "quarantine");
+  } finally { await p.close(); }
+});
+
+for (const when of ["initial", "before_dispatch", "usage", "after_task"] as const) {
+  test(`checkpoint failure at ${when} stops work and sanitizes storage diagnostics`, async () => {
+    let injected = false;
+    const snapshots: PilotReport[] = [];
+    const p = await provider((res, i) => completion(res, i));
+    try {
+      const report = await runPilot(live, p.router, { pricing, checkpoint(snapshot) {
+        const matches = when === "initial" ? snapshot.calls.length === 0
+          : when === "before_dispatch" ? snapshot.calls.length === 1
+          : when === "usage" ? snapshot.calls[0]?.usage !== null && snapshot.calls.length > 0
+          : snapshot.tasks.some(t => t.status === "done");
+        if (!injected && matches) { injected = true; throw new Error("private-checkpoint-path-sentinel"); }
+        snapshots.push(structuredClone(snapshot));
+      } });
+      assert.equal(injected, true);
+      assert.equal(report.status, "failed");
+      assert.equal(report.stop_reason, "checkpoint_error");
+      assert.equal(report.project_status, "quarantine");
+      assert.equal(p.calls.length, when === "initial" || when === "before_dispatch" ? 0 : 1);
+      assert.equal(snapshots.at(-1)?.status, "failed");
+      assert.ok(!report.tasks.some(t => ["queued", "running"].includes(t.status)));
+      const stored = JSON.stringify([report, listTasks(report.project_id), db.prepare("SELECT * FROM events").all()]);
+      assert.ok(!stored.includes("private-checkpoint-path-sentinel"));
+    } finally { await p.close(); }
+  });
+}
 
 test("unknown cache breakdown uses a labeled uncached estimate and invalid counts stay unknown", async () => {
   assert.equal(readModelUsage({ prompt_tokens: -1, completion_tokens: 2 }), null);

@@ -48,6 +48,8 @@ O máximo é de **três chamadas**, sem fallback nem repetição automática. `-
 
 O relatório contém duração, tarefas, tokens informados, uso de cache quando disponível, categorias de falha, HTTP status, QA e commit local. O aceite real exige as cinco tarefas concluídas e métricas de todas as chamadas; revisão visual/comercial permanece pendente. Resposta sem métricas ou erro de rede tem uso desconhecido. Tokens de respostas truncadas continuam registrados.
 
+O piloto interrompe a execução assim que uma resposta não informa métricas (`usage_missing`). Falhas ao salvar o relatório (`checkpoint_error`) ou contabilizar tokens (`evidence_error`) também bloqueiam novas chamadas. O projeto fica em quarentena; se o armazenamento continuar indisponível, o relatório no disco pode permanecer incompleto e o processo retorna falha. `not_sent` identifica uma tentativa impedida antes da rede por falha no checkpoint. Falha local de evidência nunca aciona fallback, inclusive fora do piloto. Erros HTTP e de validação JSON/schema usam mensagens seguras, sem copiar respostas brutas do provedor para os diagnósticos.
+
 Para estimar USD, informe `--pricing caminho.json` com tarifas conferidas por você. Nenhum preço é embutido. O JSON deve conter os campos abaixo:
 
 | Campo | Valor |
@@ -61,7 +63,7 @@ Para estimar USD, informe `--pricing caminho.json` com tarifas conferidas por vo
 
 Sem tarifa, `estimated_usd` é `null`. Quando faltam contadores de alguma chamada, a estimativa total também é `null`, e o subtotal conhecido fica separado. Sem detalhamento de cache, a estimativa usa a tarifa de entrada sem cache e informa esse método. Isso é estimativa das chamadas deste piloto, não fatura ou orçamento monetário global; o bloqueio de gastos da operação continua no backlog.
 
-Verificação local desta etapa: Node 24.19.0, build e **58 testes aprovados**. Os testes de API DeepSeek usam servidor HTTP local simulado; o aceite com a chave real continua pendente. Comandos finitos usam `node --import tsx` para não depender do pipe interno do CLI `tsx`; `npm run dev` mantém o watch anterior.
+Verificação local desta etapa: Node 24.19.0, build e **74 testes aprovados**. A instalação limpa foi reproduzida no Windows. Os testes de API DeepSeek usam servidor HTTP local simulado; o aceite com a chave real continua pendente. Comandos finitos usam `node --import tsx` para não depender do pipe interno do CLI `tsx`; `npm run dev` mantém o watch anterior.
 
 ## Fluxo implementado
 
