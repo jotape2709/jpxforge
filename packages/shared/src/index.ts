@@ -157,6 +157,7 @@ export const ProviderSchema = z.object({
 export const ModelTargetSchema = z.object({
   provider: z.enum(["deepseek", "openrouter", "ollama"]),
   model: z.string(),
+  thinking: z.enum(["enabled", "disabled"]).optional(),
 });
 
 export const RoleRouteSchema = z.object({

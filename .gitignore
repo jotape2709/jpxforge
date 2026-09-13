@@ -21,3 +21,6 @@ workspaces/*/
 tmp/
 *.lock
 output/pdf/*.png
+
+# Isolated synthetic pilots (database and model output stay local)
+.forge-pilots/
