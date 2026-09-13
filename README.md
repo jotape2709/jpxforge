@@ -37,12 +37,14 @@ npm run pilot -- --offline
 Para validar um modelo real depois de configurar a chave pelo setup:
 
 ```powershell
-npm run pilot -- --live --model deepseek-v4-flash
+npm run pilot -- --live --model deepseek-flash
 ```
 
 **`--live` faz chamadas pagas.** Sem essa opção o piloto usa fixtures. A chave também pode vir de `DEEPSEEK_API_KEY`; não a coloque no comando nem no relatório. O piloto usa somente essa chave, o endpoint oficial DeepSeek e o modelo informado para Nina, Atlas e Juno. As rotas da operação normal permanecem como estavam. O parâmetro `thinking` fica desativado neste piloto para reservar a saída ao JSON. Confirme o modelo disponível na sua conta antes da execução; a documentação atual lista [os modelos DeepSeek](https://api-docs.deepseek.com/) e [o controle de thinking](https://api-docs.deepseek.com/guides/thinking_mode/).
 
 Cada execução usa briefing fictício do Estúdio Aurora, cria um banco e workspace novos em `.forge-pilots/` e salva `pilot-report.json` antes das chamadas e ao concluir cada etapa. Não lê a fila operacional, não conecta ao WORK, não faz push e não retoma uma tentativa anterior. A pasta é ignorada pelo Git. O resultado mostra o caminho da prévia para revisão humana.
+
+Conferência em 2026-09-12: o [guia oficial](https://api-docs.deepseek.com/) recomenda `deepseek-flash` e informa que `deepseek-v4-flash` é um alias legado servido pelo V4.1-Flash. Nomes e tarifas podem mudar no provedor. O Forge não troca silenciosamente o identificador configurado; confira o modelo e a tarifa antes de uma rodada paga.
 
 O máximo é de **três chamadas**, sem fallback nem repetição automática. `--max-calls 1` ou `2` reduz esse limite; `--timeout-ms` aceita 100 a 300000 ms por chamada, com padrão de 60000. Cada chamada pede no máximo 8000 tokens de saída. Ao falhar ou cancelar, o piloto preserva a evidência em quarentena e termina com código diferente de zero. Um relatório ainda em `running` indica execução incompleta e exige inspeção. Uma nova execução paga é sempre uma nova tentativa.
 

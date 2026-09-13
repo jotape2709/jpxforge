@@ -9,7 +9,7 @@ async function main() {
   if (options.help) {
     console.log("JPXFORGE - Piloto sintético isolado\n\n" +
       "npm run pilot -- --offline\n" +
-      "npm run pilot -- --live --model deepseek-v4-flash\n" +
+      "npm run pilot -- --live --model deepseek-flash\n" +
       "Opções: --max-calls 1..3, --timeout-ms 100..300000, --pricing caminho.json\n\n" +
       "Padrão: offline. --live faz chamadas pagas à API DeepSeek. Usa somente a chave do setup\n" +
       "ou DEEPSEEK_API_KEY, um modelo sem fallback e thinking desativado. Máximo de três\n" +
